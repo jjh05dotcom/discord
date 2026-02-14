@@ -5,9 +5,17 @@ from datetime import timedelta
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 import yt_dlp
 
-TOKEN = "MTQ3MjE5OTc5MjI0MjMyNzY1NA.GBtqj3.2GAuYlDO0xgWfwegy0fnRugphwJrb1D8GQc_oE"
+# =========================
+# 토큰: 환경변수로만 받기 (절대 코드/파일에 저장 금지)
+# Render/로컬에서 DISCORD_TOKEN 설정 필요
+# =========================
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN 환경변수 설정 안 됨 (토큰을 환경변수로 넣어야 함)")
+
 DATA_FILE = "sbot_data.json"
 
 # -------------------------
@@ -49,13 +57,22 @@ def get_music_state(guild_id: int):
 
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
-        # music_channel_id는 길드별로 저장
-        return {"log_channel_id": None, "music_channel_id": {}, "warnings": {}}
+        # 길드별 저장: music_channel_id, auto_channel_id, auto_message
+        return {
+            "log_channel_id": None,
+            "music_channel_id": {},
+            "warnings": {},
+            "auto_channel_id": {},
+            "auto_message": {},
+        }
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
+
     data.setdefault("log_channel_id", None)
     data.setdefault("music_channel_id", {})
     data.setdefault("warnings", {})
+    data.setdefault("auto_channel_id", {})
+    data.setdefault("auto_message", {})
     return data
 
 
@@ -154,11 +171,46 @@ async def play_next(guild: discord.Guild):
         vc.play(source, after=after_play)
 
 
+# =========================================================
+# 0) 10분마다 자동 메시지 태스크 (길드별 설정)
+# =========================================================
+@tasks.loop(minutes=10)
+async def auto_message_task():
+    # 길드별로 설정된 채널에 메시지 보내기
+    auto_map = DATA.get("auto_channel_id", {})
+    msg_map = DATA.get("auto_message", {})
+
+    if not auto_map:
+        return
+
+    for guild in client.guilds:
+        gid = _gid(guild.id)
+        ch_id = auto_map.get(gid)
+        if not ch_id:
+            continue
+
+        ch = guild.get_channel(int(ch_id))
+        if ch and isinstance(ch, discord.TextChannel):
+            msg = msg_map.get(gid, "10분마다 자동 메시지")
+            try:
+                await ch.send(msg)
+            except Exception as e:
+                print(f"[auto_message] send failed guild={guild.id}: {e}")
+
+
+@auto_message_task.before_loop
+async def before_auto_message_task():
+    await client.wait_until_ready()
+
+
 @client.event
 async def on_ready():
     await tree.sync()
     await client.change_presence(activity=discord.Game("대박박하는 중"))
     print(f"Logged in as {client.user}")
+
+    if not auto_message_task.is_running():
+        auto_message_task.start()
 
 
 # =========================================================
@@ -170,6 +222,41 @@ async def setlog(interaction: discord.Interaction, channel: discord.TextChannel)
     DATA["log_channel_id"] = channel.id
     save_data(DATA)
     await interaction.response.send_message(f"로그 채널을 {channel.mention} 로 설정했어.", ephemeral=True)
+
+
+@tree.command(name="setauto", description="10분마다 자동 메시지 보낼 채널/문구 설정(길드별)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setauto(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    message: str = "10분마다 자동 메시지",
+):
+    gid = _gid(interaction.guild.id)
+    DATA.setdefault("auto_channel_id", {})
+    DATA.setdefault("auto_message", {})
+
+    DATA["auto_channel_id"][gid] = channel.id
+    DATA["auto_message"][gid] = message
+    save_data(DATA)
+
+    await interaction.response.send_message(
+        f"자동메시지 채널: {channel.mention}\n문구: {message}\n(10분마다 자동으로 나감)",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="delauto", description="자동 메시지 설정 삭제(길드별)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def delauto(interaction: discord.Interaction):
+    gid = _gid(interaction.guild.id)
+    DATA.setdefault("auto_channel_id", {})
+    DATA.setdefault("auto_message", {})
+
+    DATA["auto_channel_id"].pop(gid, None)
+    DATA["auto_message"].pop(gid, None)
+    save_data(DATA)
+
+    await interaction.response.send_message("이 길드의 자동메시지 설정 삭제함.", ephemeral=True)
 
 
 # =========================================================
@@ -362,7 +449,10 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
             return
         try:
             await member.timeout(until, reason=f"Warn reached {total}. {reason or ''}".strip())
-            await log_action(interaction.guild, f"🔇 AUTO-TIMEOUT: {member} {minutes}m at warnings={total} by {interaction.user}")
+            await log_action(
+                interaction.guild,
+                f"🔇 AUTO-TIMEOUT: {member} {minutes}m at warnings={total} by {interaction.user}",
+            )
         except discord.Forbidden:
             await log_action(interaction.guild, f"❌ AUTO-TIMEOUT FAILED(Forbidden): {member} warnings={total}")
 
@@ -571,6 +661,8 @@ async def on_message(message: discord.Message):
 # =========================================================
 @setlog.error
 @setmusic.error
+@setauto.error
+@delauto.error
 @kick.error
 @ban.error
 @unban.error
