@@ -10,10 +10,18 @@ from discord import app_commands
 from discord.ext import tasks
 import yt_dlp
 
+# =========================
+# 토큰: 환경변수로만 받기
+# =========================
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN 환경변수 설정 안 됨")
+
 DATA_FILE = "sbot_data.json"
 
 # -------------------------
 # 경고 누적 처벌 단계
+# 3회: 5분, 4회: 10분, 5회: 1시간, 6회: 1일, 7회: 1주, 8회: 강퇴
 # -------------------------
 WARN_TIMEOUT_MINUTES = {
     3: 5,
@@ -40,6 +48,9 @@ FFMPEG_OPTS = {
 
 # MUSIC[guild_id] = {"queue":[], "now":None, "lock":Lock(), "repeat":"off|one|all"}
 MUSIC = {}
+
+# 웹서버 runner 참조 유지(포트 열림 유지용)
+_WEB_RUNNER = None
 
 
 def get_music_state(guild_id: int):
@@ -88,7 +99,7 @@ async def log_action(guild: discord.Guild, text: str):
     ch_id = DATA.get("log_channel_id")
     if not ch_id or not guild:
         return
-    ch = guild.get_channel(ch_id)
+    ch = guild.get_channel(int(ch_id))
     if ch and isinstance(ch, discord.TextChannel):
         await ch.send(text)
 
@@ -105,24 +116,26 @@ def ytdlp_extract(query: str) -> dict:
     }
 
 
-# -------------------------
-# Discord client
-# -------------------------
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
-# =========================================================
-# Render 포트 바인딩용 웹서버 (항상 먼저 켜기)
-# =========================================================
+# =========================
+# Render keep-alive용 웹서버
+# =========================
 async def _handle_root(request):
     return web.Response(text="ok")
 
 
 async def start_web_server():
+    global _WEB_RUNNER
+    if _WEB_RUNNER is not None:
+        return  # 이미 켜져있음
+
     app = web.Application()
     app.router.add_get("/", _handle_root)
 
@@ -132,12 +145,14 @@ async def start_web_server():
     port = int(os.getenv("PORT", "10000"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"[WEB] listening on 0.0.0.0:{port}")
+
+    _WEB_RUNNER = runner
+    print(f"[web] listening on 0.0.0.0:{port}")
 
 
-# =========================================================
-# 음악 보조
-# =========================================================
+# =========================
+# 음성 관련
+# =========================
 async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("먼저 음성채널 들어가라", ephemeral=True)
@@ -187,14 +202,13 @@ async def play_next(guild: discord.Guild):
         vc.play(source, after=after_play)
 
 
-# =========================================================
-# 10분마다 자동 메시지
-# =========================================================
+# =========================
+# 10분 자동메시지
+# =========================
 @tasks.loop(minutes=10)
 async def auto_message_task():
     auto_map = DATA.get("auto_channel_id", {})
     msg_map = DATA.get("auto_message", {})
-
     if not auto_map:
         return
 
@@ -220,17 +234,21 @@ async def before_auto_message_task():
 
 @client.event
 async def on_ready():
-    await tree.sync()
+    try:
+        await tree.sync()
+    except Exception as e:
+        print("[sync] failed:", e)
+
     await client.change_presence(activity=discord.Game("대박박하는 중"))
-    print(f"[BOT] Logged in as {client.user}")
+    print(f"Logged in as {client.user}")
 
     if not auto_message_task.is_running():
         auto_message_task.start()
 
 
-# =========================================================
+# =========================
 # 1) 설정/로그
-# =========================================================
+# =========================
 @tree.command(name="setlog", description="관리 로그를 남길 채널 지정")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setlog(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -241,11 +259,7 @@ async def setlog(interaction: discord.Interaction, channel: discord.TextChannel)
 
 @tree.command(name="setauto", description="10분마다 자동 메시지 보낼 채널/문구 설정(길드별)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def setauto(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    message: str = "10분마다 자동 메시지",
-):
+async def setauto(interaction: discord.Interaction, channel: discord.TextChannel, message: str = "10분마다 자동 메시지"):
     gid = _gid(interaction.guild.id)
     DATA.setdefault("auto_channel_id", {})
     DATA.setdefault("auto_message", {})
@@ -274,9 +288,9 @@ async def delauto(interaction: discord.Interaction):
     await interaction.response.send_message("이 길드의 자동메시지 설정 삭제함.", ephemeral=True)
 
 
-# =========================================================
-# 2) 관리: 킥/밴/언밴/타임아웃
-# =========================================================
+# =========================
+# 2) 관리
+# =========================
 @tree.command(name="kick", description="유저를 킥")
 @app_commands.checks.has_permissions(kick_members=True)
 async def kick(interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
@@ -350,79 +364,9 @@ async def timeout(
         await interaction.response.send_message("권한 부족(봇 역할 위치/권한 확인).", ephemeral=True)
 
 
-# =========================================================
-# 3) 관리: 청소/잠금/해제/역할
-# =========================================================
-@tree.command(name="clear", description="메시지 여러 개 삭제")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def clear(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100]):
-    channel = interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.response.send_message("텍스트 채널에서만 가능.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    deleted = await channel.purge(limit=count)
-    await interaction.followup.send(f"{len(deleted)}개 삭제했어.", ephemeral=True)
-    await log_action(interaction.guild, f"🧹 CLEAR: {len(deleted)} msgs in #{channel} by {interaction.user}")
-
-
-@tree.command(name="lock", description="현재 채널 잠금(기본 역할 전송 금지)")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def lock(interaction: discord.Interaction):
-    channel = interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.response.send_message("텍스트 채널에서만 가능.", ephemeral=True)
-
-    everyone = interaction.guild.default_role
-    overwrite = channel.overwrites_for(everyone)
-    overwrite.send_messages = False
-    await channel.set_permissions(everyone, overwrite=overwrite)
-
-    await interaction.response.send_message("채널 잠금 완료.", ephemeral=True)
-    await log_action(interaction.guild, f"🔒 LOCK: #{channel} by {interaction.user}")
-
-
-@tree.command(name="unlock", description="현재 채널 잠금 해제(기본 역할 전송 허용)")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def unlock(interaction: discord.Interaction):
-    channel = interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.response.send_message("텍스트 채널에서만 가능.", ephemeral=True)
-
-    everyone = interaction.guild.default_role
-    overwrite = channel.overwrites_for(everyone)
-    overwrite.send_messages = None
-    await channel.set_permissions(everyone, overwrite=overwrite)
-
-    await interaction.response.send_message("채널 잠금 해제 완료.", ephemeral=True)
-    await log_action(interaction.guild, f"🔓 UNLOCK: #{channel} by {interaction.user}")
-
-
-@tree.command(name="role_add", description="유저에게 역할 추가")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def role_add(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
-    try:
-        await member.add_roles(role)
-        await interaction.response.send_message(f"{member.mention} 에게 {role.mention} 추가 완료.", ephemeral=True)
-        await log_action(interaction.guild, f"➕ ROLE_ADD: {role} to {member} by {interaction.user}")
-    except discord.Forbidden:
-        await interaction.response.send_message("권한 부족(봇 역할이 해당 역할보다 위여야 함).", ephemeral=True)
-
-
-@tree.command(name="role_remove", description="유저에게서 역할 제거")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def role_remove(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
-    try:
-        await member.remove_roles(role)
-        await interaction.response.send_message(f"{member.mention} 에서 {role.mention} 제거 완료.", ephemeral=True)
-        await log_action(interaction.guild, f"➖ ROLE_REMOVE: {role} from {member} by {interaction.user}")
-    except discord.Forbidden:
-        await interaction.response.send_message("권한 부족(봇 역할이 해당 역할보다 위여야 함).", ephemeral=True)
-
-
-# =========================================================
-# 4) 관리: 경고 시스템
-# =========================================================
+# =========================
+# 3) 경고 시스템
+# =========================
 @tree.command(name="warn", description="유저 경고 1회 추가(3회부터 자동 처벌)")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def warn(interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
@@ -462,7 +406,10 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
             return
         try:
             await member.timeout(until, reason=f"Warn reached {total}. {reason or ''}".strip())
-            await log_action(interaction.guild, f"🔇 AUTO-TIMEOUT: {member} {minutes}m at warnings={total} by {interaction.user}")
+            await log_action(
+                interaction.guild,
+                f"🔇 AUTO-TIMEOUT: {member} {minutes}m at warnings={total} by {interaction.user}",
+            )
         except discord.Forbidden:
             await log_action(interaction.guild, f"❌ AUTO-TIMEOUT FAILED(Forbidden): {member} warnings={total}")
 
@@ -504,9 +451,9 @@ async def clearwarnings(interaction: discord.Interaction, member: discord.Member
     await log_action(interaction.guild, f"🧽 CLEARWARN: {member} by {interaction.user}")
 
 
-# =========================================================
-# 5) 음악: 전용 채널 지정 + 반복 + 명령어
-# =========================================================
+# =========================
+# 4) 음악
+# =========================
 @tree.command(name="setmusic", description="음악 자동재생 전용 채널 지정(길드별 저장)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setmusic(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -545,7 +492,14 @@ async def play(interaction: discord.Interaction, query: str):
     try:
         track = await loop.run_in_executor(None, ytdlp_extract, query)
     except Exception as e:
-        return await interaction.followup.send(f"검색/추출 실패: {e}", ephemeral=True)
+        # 유튜브가 'not a bot' 걸면 여기로 떨어짐
+        return await interaction.followup.send(
+            "추출 실패.\n"
+            f"- 에러: {e}\n\n"
+            "요즘 유튜브가 서버에서 yt-dlp 막는 경우가 많아서 불안정함.\n"
+            "사운드클라우드/직링(mp3) 같은 걸로 테스트해봐.",
+            ephemeral=True,
+        )
 
     state = get_music_state(interaction.guild.id)
     state["queue"].append(track)
@@ -619,25 +573,19 @@ async def queue(interaction: discord.Interaction):
     await interaction.response.send_message("대기열:\n" + "\n".join(lines), ephemeral=True)
 
 
-# =========================================================
-# 6) 전용 채널에서: 메시지로 자동 재생 (/play 없이)
-# =========================================================
+# 전용 채널에서 메시지로 자동 재생
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
     gid = _gid(message.guild.id)
-    music_map = DATA.get("music_channel_id", {})
-    music_ch_id = music_map.get(gid)
-
-    if not music_ch_id or message.channel.id != music_ch_id:
+    music_ch_id = DATA.get("music_channel_id", {}).get(gid)
+    if not music_ch_id or message.channel.id != int(music_ch_id):
         return
 
     content = (message.content or "").strip()
-    if not content:
-        return
-    if content.startswith("/") or content.startswith("!"):
+    if not content or content.startswith("/") or content.startswith("!"):
         return
 
     if not message.author.voice or not message.author.voice.channel:
@@ -663,9 +611,7 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"실패: {e}")
 
 
-# =========================================================
-# 에러 처리
-# =========================================================
+# 권한 에러 처리
 @setlog.error
 @setmusic.error
 @setauto.error
@@ -674,11 +620,6 @@ async def on_message(message: discord.Message):
 @ban.error
 @unban.error
 @timeout.error
-@clear.error
-@lock.error
-@unlock.error
-@role_add.error
-@role_remove.error
 @warn.error
 @warnings.error
 @clearwarnings.error
@@ -695,17 +636,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-# =========================================================
-# 진짜 시작점 (Render 포트 -> 토큰 체크 -> 봇 시작)
-# =========================================================
 async def main():
-    await start_web_server()  # 무조건 포트부터 열기
-
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN 환경변수 설정 안 됨")
-
-    await client.start(token)
+    # Render에서 포트 열어두기
+    await start_web_server()
+    # 디코 봇 시작
+    await client.start(TOKEN)
 
 
 if __name__ == "__main__":
