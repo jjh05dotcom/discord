@@ -1,2 +1,3 @@
-discord.py==2.4.0
-yt-dlp==2025.1.26
+aiohttp
+discord.py
+yt-dlp
