@@ -1,3 +1,5 @@
+from aiohttp import web
+
 import json
 import os
 import asyncio
@@ -8,19 +10,10 @@ from discord import app_commands
 from discord.ext import tasks
 import yt_dlp
 
-# =========================
-# 토큰: 환경변수로만 받기 (절대 코드/파일에 저장 금지)
-# Render/로컬에서 DISCORD_TOKEN 설정 필요
-# =========================
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN 환경변수 설정 안 됨 (토큰을 환경변수로 넣어야 함)")
-
 DATA_FILE = "sbot_data.json"
 
 # -------------------------
-# 경고 누적 처벌 단계 (3회부터 적용)
-# 3회: 5분, 4회: 10분, 5회: 1시간, 6회: 1일, 7회: 1주, 8회: 강퇴
+# 경고 누적 처벌 단계
 # -------------------------
 WARN_TIMEOUT_MINUTES = {
     3: 5,
@@ -38,7 +31,7 @@ YTDLP_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
-    "default_search": "ytsearch1",  # 제목 넣으면 유튜브 검색 1개
+    "default_search": "ytsearch1",
 }
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -57,7 +50,6 @@ def get_music_state(guild_id: int):
 
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
-        # 길드별 저장: music_channel_id, auto_channel_id, auto_message
         return {
             "log_channel_id": None,
             "music_channel_id": {},
@@ -113,13 +105,39 @@ def ytdlp_extract(query: str) -> dict:
     }
 
 
+# -------------------------
+# Discord client
+# -------------------------
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True  # 전용 음악 채널에서 메시지로 자동재생하려면 필수
+intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
+# =========================================================
+# Render 포트 바인딩용 웹서버 (항상 먼저 켜기)
+# =========================================================
+async def _handle_root(request):
+    return web.Response(text="ok")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", _handle_root)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[WEB] listening on 0.0.0.0:{port}")
+
+
+# =========================================================
+# 음악 보조
+# =========================================================
 async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("먼저 음성채널 들어가라", ephemeral=True)
@@ -145,7 +163,6 @@ async def play_next(guild: discord.Guild):
         if vc.is_playing() or vc.is_paused():
             return
 
-        # repeat one: 지금 곡 계속 반복
         if state["repeat"] == "one" and state["now"]:
             track = state["now"]
         else:
@@ -158,7 +175,6 @@ async def play_next(guild: discord.Guild):
         source = discord.FFmpegPCMAudio(track["stream_url"], **FFMPEG_OPTS)
 
         def after_play(err):
-            # repeat all: 방금 곡을 큐 맨 뒤로 다시 넣기
             if state["repeat"] == "all":
                 state["queue"].append(track)
 
@@ -172,11 +188,10 @@ async def play_next(guild: discord.Guild):
 
 
 # =========================================================
-# 0) 10분마다 자동 메시지 태스크 (길드별 설정)
+# 10분마다 자동 메시지
 # =========================================================
 @tasks.loop(minutes=10)
 async def auto_message_task():
-    # 길드별로 설정된 채널에 메시지 보내기
     auto_map = DATA.get("auto_channel_id", {})
     msg_map = DATA.get("auto_message", {})
 
@@ -207,7 +222,7 @@ async def before_auto_message_task():
 async def on_ready():
     await tree.sync()
     await client.change_presence(activity=discord.Game("대박박하는 중"))
-    print(f"Logged in as {client.user}")
+    print(f"[BOT] Logged in as {client.user}")
 
     if not auto_message_task.is_running():
         auto_message_task.start()
@@ -406,7 +421,7 @@ async def role_remove(interaction: discord.Interaction, member: discord.Member, 
 
 
 # =========================================================
-# 4) 관리: 경고 시스템 (+ 누적 자동 처벌)
+# 4) 관리: 경고 시스템
 # =========================================================
 @tree.command(name="warn", description="유저 경고 1회 추가(3회부터 자동 처벌)")
 @app_commands.checks.has_permissions(moderate_members=True)
@@ -431,7 +446,6 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
     await interaction.response.send_message(f"{member} 경고 추가됨. (누적 {total})", ephemeral=True)
     await log_action(interaction.guild, f"⚠️ WARN: {member} now {total} by {interaction.user} | reason: {reason}")
 
-    # 8회부터 강퇴
     if total >= WARN_KICK_AT:
         try:
             await member.kick(reason=f"Warn reached {total}. {reason or ''}".strip())
@@ -440,7 +454,6 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
             await log_action(interaction.guild, f"❌ AUTO-KICK FAILED(Forbidden): {member} warnings={total}")
         return
 
-    # 3~7회 타임아웃
     minutes = WARN_TIMEOUT_MINUTES.get(total)
     if minutes:
         until = discord.utils.utcnow() + timedelta(minutes=minutes)
@@ -449,10 +462,7 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
             return
         try:
             await member.timeout(until, reason=f"Warn reached {total}. {reason or ''}".strip())
-            await log_action(
-                interaction.guild,
-                f"🔇 AUTO-TIMEOUT: {member} {minutes}m at warnings={total} by {interaction.user}",
-            )
+            await log_action(interaction.guild, f"🔇 AUTO-TIMEOUT: {member} {minutes}m at warnings={total} by {interaction.user}")
         except discord.Forbidden:
             await log_action(interaction.guild, f"❌ AUTO-TIMEOUT FAILED(Forbidden): {member} warnings={total}")
 
@@ -627,12 +637,9 @@ async def on_message(message: discord.Message):
     content = (message.content or "").strip()
     if not content:
         return
-
-    # 커맨드 느낌은 무시
     if content.startswith("/") or content.startswith("!"):
         return
 
-    # 유저가 음성채널에 있어야 함
     if not message.author.voice or not message.author.voice.channel:
         return await message.channel.send("먼저 음성채널 들어가라")
 
@@ -657,7 +664,7 @@ async def on_message(message: discord.Message):
 
 
 # =========================================================
-# 에러 처리(권한 부족 메시지)
+# 에러 처리
 # =========================================================
 @setlog.error
 @setmusic.error
@@ -688,4 +695,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-client.run(TOKEN)
+# =========================================================
+# 진짜 시작점 (Render 포트 -> 토큰 체크 -> 봇 시작)
+# =========================================================
+async def main():
+    await start_web_server()  # 무조건 포트부터 열기
+
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN 환경변수 설정 안 됨")
+
+    await client.start(token)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
