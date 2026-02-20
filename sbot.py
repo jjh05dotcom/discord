@@ -12,10 +12,11 @@ import yt_dlp
 
 # =========================
 # 토큰: 환경변수로만 받기
+# Render/로컬에서 DISCORD_TOKEN 설정 필요
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN 환경변수 설정 안 됨")
+    raise RuntimeError("DISCORD_TOKEN 환경변수 설정 안 됨 (토큰을 환경변수로 넣어야 함)")
 
 DATA_FILE = "sbot_data.json"
 
@@ -33,14 +34,15 @@ WARN_TIMEOUT_MINUTES = {
 WARN_KICK_AT = 8
 
 # -------------------------
-# 음악 설정
+# yt-dlp / FFMPEG 설정
 # -------------------------
-YTDLP_OPTS = {
+BASE_YTDLP_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
-    "default_search": "ytsearch1",
+    "nocheckcertificate": True,
 }
+
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
@@ -48,9 +50,6 @@ FFMPEG_OPTS = {
 
 # MUSIC[guild_id] = {"queue":[], "now":None, "lock":Lock(), "repeat":"off|one|all"}
 MUSIC = {}
-
-# 웹서버 runner 참조 유지(포트 열림 유지용)
-_WEB_RUNNER = None
 
 
 def get_music_state(guild_id: int):
@@ -99,16 +98,49 @@ async def log_action(guild: discord.Guild, text: str):
     ch_id = DATA.get("log_channel_id")
     if not ch_id or not guild:
         return
-    ch = guild.get_channel(int(ch_id))
+    ch = guild.get_channel(ch_id)
     if ch and isinstance(ch, discord.TextChannel):
         await ch.send(text)
 
 
-def ytdlp_extract(query: str) -> dict:
-    with yt_dlp.YoutubeDL(YTDLP_OPTS) as ydl:
-        info = ydl.extract_info(query, download=False)
+def _is_url(s: str) -> bool:
+    s = (s or "").strip().lower()
+    return s.startswith("http://") or s.startswith("https://")
+
+
+def ytdlp_extract(query: str, source: str = "auto") -> dict:
+    """
+    source:
+      - "auto": URL이면 그대로, 아니면 SoundCloud 검색으로 시도
+      - "soundcloud": SoundCloud 검색/URL 위주
+      - "direct": URL만 허용
+    """
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("빈 query")
+
+    if source == "direct":
+        if not _is_url(q):
+            raise ValueError("direct 모드는 URL만 가능")
+        yq = q
+        yopts = dict(BASE_YTDLP_OPTS)
+
+    elif source == "soundcloud":
+        yopts = dict(BASE_YTDLP_OPTS)
+        # SoundCloud 검색 prefix: scsearch1:<query>
+        yq = q if _is_url(q) else f"scsearch1:{q}"
+
+    else:  # auto
+        yopts = dict(BASE_YTDLP_OPTS)
+        # 유튜브는 요즘 봇체크/쿠키 문제로 자주 막힘 → 기본은 SoundCloud 검색으로
+        yq = q if _is_url(q) else f"scsearch1:{q}"
+
+    with yt_dlp.YoutubeDL(yopts) as ydl:
+        info = ydl.extract_info(yq, download=False)
+
     if "entries" in info:
         info = info["entries"][0]
+
     return {
         "title": info.get("title", "unknown"),
         "webpage_url": info.get("webpage_url"),
@@ -118,41 +150,34 @@ def ytdlp_extract(query: str) -> dict:
 
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True
+intents.message_content = True  # 전용 음악 채널에서 메시지로 자동재생하려면 필요
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
-# =========================
-# Render keep-alive용 웹서버
-# =========================
+# =========================================================
+# Render 포트 바인딩용 웹서버 (UptimeRobot용)
+# =========================================================
 async def _handle_root(request):
     return web.Response(text="ok")
 
 
 async def start_web_server():
-    global _WEB_RUNNER
-    if _WEB_RUNNER is not None:
-        return  # 이미 켜져있음
-
     app = web.Application()
     app.router.add_get("/", _handle_root)
 
     runner = web.AppRunner(app)
     await runner.setup()
 
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", "10000"))  # Render가 PORT 환경변수로 줌
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    _WEB_RUNNER = runner
-    print(f"[web] listening on 0.0.0.0:{port}")
 
-
-# =========================
-# 음성 관련
-# =========================
+# =========================================================
+# Voice helpers
+# =========================================================
 async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("먼저 음성채널 들어가라", ephemeral=True)
@@ -202,9 +227,9 @@ async def play_next(guild: discord.Guild):
         vc.play(source, after=after_play)
 
 
-# =========================
-# 10분 자동메시지
-# =========================
+# =========================================================
+# 10분마다 자동 메시지 태스크 (길드별 설정)
+# =========================================================
 @tasks.loop(minutes=10)
 async def auto_message_task():
     auto_map = DATA.get("auto_channel_id", {})
@@ -234,21 +259,20 @@ async def before_auto_message_task():
 
 @client.event
 async def on_ready():
-    try:
-        await tree.sync()
-    except Exception as e:
-        print("[sync] failed:", e)
-
+    await tree.sync()
     await client.change_presence(activity=discord.Game("대박박하는 중"))
     print(f"Logged in as {client.user}")
+
+    # Render/UptimeRobot용 포트 열기
+    await start_web_server()
 
     if not auto_message_task.is_running():
         auto_message_task.start()
 
 
-# =========================
+# =========================================================
 # 1) 설정/로그
-# =========================
+# =========================================================
 @tree.command(name="setlog", description="관리 로그를 남길 채널 지정")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setlog(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -259,7 +283,11 @@ async def setlog(interaction: discord.Interaction, channel: discord.TextChannel)
 
 @tree.command(name="setauto", description="10분마다 자동 메시지 보낼 채널/문구 설정(길드별)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def setauto(interaction: discord.Interaction, channel: discord.TextChannel, message: str = "10분마다 자동 메시지"):
+async def setauto(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    message: str = "10분마다 자동 메시지",
+):
     gid = _gid(interaction.guild.id)
     DATA.setdefault("auto_channel_id", {})
     DATA.setdefault("auto_message", {})
@@ -288,9 +316,9 @@ async def delauto(interaction: discord.Interaction):
     await interaction.response.send_message("이 길드의 자동메시지 설정 삭제함.", ephemeral=True)
 
 
-# =========================
-# 2) 관리
-# =========================
+# =========================================================
+# 2) 관리: 킥/밴/언밴/타임아웃
+# =========================================================
 @tree.command(name="kick", description="유저를 킥")
 @app_commands.checks.has_permissions(kick_members=True)
 async def kick(interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
@@ -364,9 +392,95 @@ async def timeout(
         await interaction.response.send_message("권한 부족(봇 역할 위치/권한 확인).", ephemeral=True)
 
 
-# =========================
-# 3) 경고 시스템
-# =========================
+# =========================================================
+# 3) 관리: 청소(/clear) - 원하는 개수만큼 (최대 500)
+# =========================================================
+@tree.command(name="clear", description="메시지 여러 개 삭제(최대 500, 100개씩 나눠 삭제)")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def clear(interaction: discord.Interaction, count: app_commands.Range[int, 1, 500]):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("텍스트 채널에서만 가능.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    remaining = int(count)
+    total_deleted = 0
+
+    while remaining > 0:
+        batch = min(remaining, 100)  # 디코 purge는 보통 100 단위가 안정적
+        deleted = await channel.purge(limit=batch)
+        total_deleted += len(deleted)
+        remaining -= batch
+
+        # 너무 빠르게 치면 레이트리밋 걸릴 수 있어서 살짝 텀
+        await asyncio.sleep(0.7)
+
+        # 더 이상 지울 게 없으면 종료
+        if len(deleted) == 0:
+            break
+
+    await interaction.followup.send(f"{total_deleted}개 삭제했어.", ephemeral=True)
+    await log_action(interaction.guild, f"🧹 CLEAR: {total_deleted} msgs in #{channel} by {interaction.user}")
+
+
+@tree.command(name="lock", description="현재 채널 잠금(기본 역할 전송 금지)")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def lock(interaction: discord.Interaction):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("텍스트 채널에서만 가능.", ephemeral=True)
+
+    everyone = interaction.guild.default_role
+    overwrite = channel.overwrites_for(everyone)
+    overwrite.send_messages = False
+    await channel.set_permissions(everyone, overwrite=overwrite)
+
+    await interaction.response.send_message("채널 잠금 완료.", ephemeral=True)
+    await log_action(interaction.guild, f"🔒 LOCK: #{channel} by {interaction.user}")
+
+
+@tree.command(name="unlock", description="현재 채널 잠금 해제(기본 역할 전송 허용)")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def unlock(interaction: discord.Interaction):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("텍스트 채널에서만 가능.", ephemeral=True)
+
+    everyone = interaction.guild.default_role
+    overwrite = channel.overwrites_for(everyone)
+    overwrite.send_messages = None
+    await channel.set_permissions(everyone, overwrite=overwrite)
+
+    await interaction.response.send_message("채널 잠금 해제 완료.", ephemeral=True)
+    await log_action(interaction.guild, f"🔓 UNLOCK: #{channel} by {interaction.user}")
+
+
+@tree.command(name="role_add", description="유저에게 역할 추가")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def role_add(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+    try:
+        await member.add_roles(role)
+        await interaction.response.send_message(f"{member.mention} 에게 {role.mention} 추가 완료.", ephemeral=True)
+        await log_action(interaction.guild, f"➕ ROLE_ADD: {role} to {member} by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message("권한 부족(봇 역할이 해당 역할보다 위여야 함).", ephemeral=True)
+
+
+@tree.command(name="role_remove", description="유저에게서 역할 제거")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def role_remove(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+    try:
+        await member.remove_roles(role)
+        await interaction.response.send_message(f"{member.mention} 에서 {role.mention} 제거 완료.", ephemeral=True)
+        await log_action(interaction.guild, f"➖ ROLE_REMOVE: {role} from {member} by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message("권한 부족(봇 역할이 해당 역할보다 위여야 함).", ephemeral=True)
+
+
+# =========================================================
+# 4) 관리: 경고 시스템 (+ 누적 자동 처벌)
+# =========================================================
 @tree.command(name="warn", description="유저 경고 1회 추가(3회부터 자동 처벌)")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def warn(interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
@@ -451,9 +565,9 @@ async def clearwarnings(interaction: discord.Interaction, member: discord.Member
     await log_action(interaction.guild, f"🧽 CLEARWARN: {member} by {interaction.user}")
 
 
-# =========================
-# 4) 음악
-# =========================
+# =========================================================
+# 5) 음악: SoundCloud 중심 + URL 재생 지원
+# =========================================================
 @tree.command(name="setmusic", description="음악 자동재생 전용 채널 지정(길드별 저장)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setmusic(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -481,7 +595,7 @@ async def join(interaction: discord.Interaction):
         await interaction.response.send_message("들어감", ephemeral=True)
 
 
-@tree.command(name="play", description="URL 또는 제목으로 재생(큐에 추가)")
+@tree.command(name="play", description="기본: SoundCloud 검색(제목) 또는 URL 재생(큐에 추가)")
 async def play(interaction: discord.Interaction, query: str):
     vc = await ensure_voice(interaction)
     if not vc:
@@ -490,21 +604,54 @@ async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer(ephemeral=True)
     loop = asyncio.get_running_loop()
     try:
-        track = await loop.run_in_executor(None, ytdlp_extract, query)
+        track = await loop.run_in_executor(None, ytdlp_extract, query, "auto")
     except Exception as e:
-        # 유튜브가 'not a bot' 걸면 여기로 떨어짐
-        return await interaction.followup.send(
-            "추출 실패.\n"
-            f"- 에러: {e}\n\n"
-            "요즘 유튜브가 서버에서 yt-dlp 막는 경우가 많아서 불안정함.\n"
-            "사운드클라우드/직링(mp3) 같은 걸로 테스트해봐.",
-            ephemeral=True,
-        )
+        return await interaction.followup.send(f"추출 실패: {e}", ephemeral=True)
 
     state = get_music_state(interaction.guild.id)
     state["queue"].append(track)
 
     await interaction.followup.send(f"큐 추가됨: **{track['title']}**", ephemeral=True)
+    await play_next(interaction.guild)
+
+
+@tree.command(name="playsc", description="SoundCloud에서만 검색/재생(제목 또는 SoundCloud URL)")
+async def playsc(interaction: discord.Interaction, query: str):
+    vc = await ensure_voice(interaction)
+    if not vc:
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    loop = asyncio.get_running_loop()
+    try:
+        track = await loop.run_in_executor(None, ytdlp_extract, query, "soundcloud")
+    except Exception as e:
+        return await interaction.followup.send(f"SoundCloud 추출 실패: {e}", ephemeral=True)
+
+    state = get_music_state(interaction.guild.id)
+    state["queue"].append(track)
+
+    await interaction.followup.send(f"(SC) 큐 추가됨: **{track['title']}**", ephemeral=True)
+    await play_next(interaction.guild)
+
+
+@tree.command(name="playurl", description="직접 오디오 URL(mp3/m3u8/ogg 등) 재생(큐에 추가)")
+async def playurl(interaction: discord.Interaction, url: str):
+    vc = await ensure_voice(interaction)
+    if not vc:
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    loop = asyncio.get_running_loop()
+    try:
+        track = await loop.run_in_executor(None, ytdlp_extract, url, "direct")
+    except Exception as e:
+        return await interaction.followup.send(f"URL 추출 실패: {e}", ephemeral=True)
+
+    state = get_music_state(interaction.guild.id)
+    state["queue"].append(track)
+
+    await interaction.followup.send(f"(URL) 큐 추가됨: **{track['title']}**", ephemeral=True)
     await play_next(interaction.guild)
 
 
@@ -573,19 +720,28 @@ async def queue(interaction: discord.Interaction):
     await interaction.response.send_message("대기열:\n" + "\n".join(lines), ephemeral=True)
 
 
-# 전용 채널에서 메시지로 자동 재생
+# =========================================================
+# 6) 전용 채널에서: 메시지로 자동 재생 (/play 없이)
+#   - 기본은 SoundCloud 검색
+#   - URL이면 URL 재생
+# =========================================================
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
     gid = _gid(message.guild.id)
-    music_ch_id = DATA.get("music_channel_id", {}).get(gid)
-    if not music_ch_id or message.channel.id != int(music_ch_id):
+    music_map = DATA.get("music_channel_id", {})
+    music_ch_id = music_map.get(gid)
+
+    if not music_ch_id or message.channel.id != music_ch_id:
         return
 
     content = (message.content or "").strip()
-    if not content or content.startswith("/") or content.startswith("!"):
+    if not content:
+        return
+
+    if content.startswith("/") or content.startswith("!"):
         return
 
     if not message.author.voice or not message.author.voice.channel:
@@ -599,7 +755,8 @@ async def on_message(message: discord.Message):
             await vc.move_to(message.author.voice.channel)
 
         loop = asyncio.get_running_loop()
-        track = await loop.run_in_executor(None, ytdlp_extract, content)
+        src = "direct" if _is_url(content) else "soundcloud"
+        track = await loop.run_in_executor(None, ytdlp_extract, content, src)
 
         state = get_music_state(message.guild.id)
         state["queue"].append(track)
@@ -611,7 +768,9 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"실패: {e}")
 
 
-# 권한 에러 처리
+# =========================================================
+# 에러 처리(권한 부족 메시지)
+# =========================================================
 @setlog.error
 @setmusic.error
 @setauto.error
@@ -620,6 +779,11 @@ async def on_message(message: discord.Message):
 @ban.error
 @unban.error
 @timeout.error
+@clear.error
+@lock.error
+@unlock.error
+@role_add.error
+@role_remove.error
 @warn.error
 @warnings.error
 @clearwarnings.error
@@ -636,12 +800,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(msg, ephemeral=True)
 
 
+# =========================================================
+# 메인 엔트리
+# =========================================================
 async def main():
-    # Render에서 포트 열어두기
-    await start_web_server()
-    # 디코 봇 시작
     await client.start(TOKEN)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
