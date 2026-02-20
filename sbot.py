@@ -81,9 +81,12 @@ async def log_action(guild: discord.Guild, text: str):
     ch_id = DATA.get("log_channel_id")
     if not ch_id or not guild:
         return
-    ch = guild.get_channel(ch_id)
+    ch = guild.get_channel(int(ch_id))
     if ch and isinstance(ch, discord.TextChannel):
-        await ch.send(text)
+        try:
+            await ch.send(text)  # ✅ 로그는 삭제 안 함
+        except Exception as e:
+            print(f"[log_action] failed: {e}")
 
 
 # =========================================================
@@ -124,9 +127,13 @@ async def auto_message_task():
 
         ch = guild.get_channel(int(ch_id))
         if ch and isinstance(ch, discord.TextChannel):
-            msg = msg_map.get(gid, "10분마다 자동 메시지")
+            msg_text = msg_map.get(gid, "10분마다 자동 메시지")
             try:
-                await ch.send(msg)
+                sent = await ch.send(msg_text)
+                await sent.delete(delay=10)  # ✅ 자동메시지만 10초 뒤 삭제
+            except discord.Forbidden:
+                # 삭제 권한 없으면 그냥 보내기만 하고 끝
+                pass
             except Exception as e:
                 print(f"[auto_message] send failed guild={guild.id}: {e}")
 
