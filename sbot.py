@@ -138,13 +138,18 @@ async def before_auto_message_task():
 
 @client.event
 async def on_ready():
-    await tree.sync()
+    guild_id = os.getenv("1332296150086189110")  # 서버 ID를 환경변수로
+    if guild_id:
+        guild = discord.Object(id=int(guild_id))
+        tree.copy_global_to(guild=guild)
+        synced = await tree.sync(guild=guild)   # ✅ 서버 전용 즉시 등록
+        print(f"[SYNC] guild synced: {len(synced)} commands")
+    else:
+        synced = await tree.sync()              # 글로벌(느림)
+        print(f"[SYNC] global synced: {len(synced)} commands")
+
     await client.change_presence(activity=discord.Game("대박박하는 중"))
     print(f"Logged in as {client.user}")
-
-    if not auto_message_task.is_running():
-        auto_message_task.start()
-
 
 # =========================================================
 # 1) 설정/로그/자동메시지
